@@ -46,8 +46,6 @@ class VariationalInformationBottleneck(nn.Module):
         self.aux_semantics = nn.Linear(latent_dim, 7)
         self.aux_waypoints = nn.Sequential(nn.Linear(latent_dim, latent_dim),
                                           nn.ReLU(), nn.Linear(latent_dim, pred_len * 2))
-        # The paper leaves the spatial decoder unspecified. This implementation
-        # uses one linear grid decoder and one convolution, entirely downstream of z.
         self.spatial_projection = nn.Linear(latent_dim, spatial_channels * spatial_grid ** 2)
         self.spatial_refinement = nn.Conv2d(spatial_channels, spatial_channels, 3, padding=1)
 
@@ -257,7 +255,6 @@ class BEVEnhancement(nn.Module):
         self.register_buffer('alpha_bars', torch.cumprod(1.0 - betas, dim=0))
         self._representation_frozen = False
         if self.stage == 'representation':
-            # This projection only receives planning supervision in the next stage.
             self.planning_projection.requires_grad_(False)
         if not self.layout_conditioning:
             self.layout_encoder.box_embedding.requires_grad_(False)
@@ -373,7 +370,6 @@ class BEVEnhancement(nn.Module):
             result['features'] = F.interpolate(enhanced, bev.shape[-2:], mode='bilinear', align_corners=False)
             result['fused_delta'] = self.planning_projection(result['features'].mean(dim=(-1, -2)))
         elif self.clean_residual:
-            # This is the explicit legacy compatibility/ablation branch only.
             clean_working = F.adaptive_avg_pool2d(bev, size)
             condition = self._condition(result['latent'], clean_time)
             fused = self.clean_projection(clean_working) + condition[:, :, None, None]
