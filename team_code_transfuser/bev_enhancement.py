@@ -31,10 +31,14 @@ def timestep_embedding(timesteps, dimension):
 
 
 class VariationalInformationBottleneck(nn.Module):
-    def __init__(self, latent_dim, token_grid, pred_len, sigma_min, sigma_max):
+    def __init__(self, latent_dim, token_grid, pred_len, sigma_min, sigma_max,
+                 spatial_channels, spatial_grid=4):
         super().__init__()
         self.token_grid, self.pred_len = token_grid, pred_len
         self.sigma_min, self.sigma_max = sigma_min, sigma_max
+        self.spatial_channels, self.spatial_grid = spatial_channels, spatial_grid
+        if min(spatial_channels, spatial_grid) < 1:
+            raise ValueError('VIB spatial channels and grid must be positive')
         self.encoder = nn.Sequential(nn.Linear(token_grid ** 2, latent_dim),
                                      SafeBatchNorm1d(latent_dim), nn.ReLU(), nn.Dropout(0.1))
         self.mean = nn.Linear(latent_dim, latent_dim)
@@ -42,8 +46,12 @@ class VariationalInformationBottleneck(nn.Module):
         self.aux_semantics = nn.Linear(latent_dim, 7)
         self.aux_waypoints = nn.Sequential(nn.Linear(latent_dim, latent_dim),
                                           nn.ReLU(), nn.Linear(latent_dim, pred_len * 2))
+        # The paper leaves the spatial decoder unspecified. This implementation
+        # uses one linear grid decoder and one convolution, entirely downstream of z.
+        self.spatial_projection = nn.Linear(latent_dim, spatial_channels * spatial_grid ** 2)
+        self.spatial_refinement = nn.Conv2d(spatial_channels, spatial_channels, 3, padding=1)
 
-    def forward(self, bev, compute_auxiliary=None):
+    def forward(self, bev, compute_auxiliary=None, spatial_size=None):
         if compute_auxiliary is None:
             compute_auxiliary = self.training
         pooled = F.adaptive_avg_pool2d(bev.mean(1, keepdim=True), (self.token_grid, self.token_grid))
@@ -56,7 +64,13 @@ class VariationalInformationBottleneck(nn.Module):
         loss_kl = 0.5 * (mean.float().square() + sigma.square() - 1.0
                          - 2.0 * sigma.log()).sum(-1).mean()
         latent = latent.to(mean.dtype)
-        result = {'latent': latent, 'loss_kl': loss_kl}
+        spatial = self.spatial_projection(latent).reshape(
+            bev.shape[0], self.spatial_channels, self.spatial_grid, self.spatial_grid)
+        spatial = F.interpolate(spatial, spatial_size or bev.shape[-2:],
+                                mode='bilinear', align_corners=False)
+        spatial = self.spatial_refinement(F.silu(spatial))
+        result = {'semantic_latent': latent, 'spatial_bev': spatial,
+                  'latent': latent, 'loss_kl': loss_kl}
         if compute_auxiliary:
             result['aux_semantics'] = self.aux_semantics(latent)
             result['aux_waypoints'] = self.aux_waypoints(latent).reshape(bev.shape[0], self.pred_len, 2)
@@ -196,13 +210,22 @@ class BEVEnhancement(nn.Module):
         self.channels, self.stage = channels, config.bev_stage
         if self.stage not in ('representation', 'planning', 'joint'):
             raise ValueError('Invalid BEV stage')
-        if config.bev_diffusion_inference != 'bypass':
-            raise ValueError('Only auxiliary diffusion with the clean bypass path is implemented')
+        self.inference_mode = config.bev_diffusion_inference
+        if self.inference_mode not in ('single_step', 'bypass'):
+            raise ValueError('bev_diffusion_inference must be single_step or bypass')
         self.working_resolution = int(config.bev_working_resolution)
         self.diffusion_steps = int(config.bev_diffusion_steps)
+        self.inference_t = getattr(config, 'bev_diffusion_inference_t', 0)
+        self.input_state = getattr(config, 'bev_diffusion_input_state', 'observed_as_xt')
+        if isinstance(self.inference_t, bool) or not isinstance(self.inference_t, int) or not 0 <= self.inference_t < self.diffusion_steps:
+            raise ValueError('bev_diffusion_inference_t must index the diffusion schedule')
+        if self.input_state != 'observed_as_xt':
+            raise ValueError('Only the explicit observed_as_xt input assumption is implemented')
         self.semantic_conditioning = config.bev_semantic_conditioning
         self.layout_conditioning = config.bev_layout_conditioning
         self.clean_residual = config.bev_clean_residual
+        if self.inference_mode == 'single_step' and (not config.bev_diffusion_enabled or not self.clean_residual):
+            raise ValueError('single_step requires diffusion and feature enhancement; select bypass explicitly for the legacy ablation')
         width, heads = int(config.bev_unet_channels), int(config.bev_attention_heads)
         latent_dim, grid = int(config.bev_latent_dim), int(config.bev_token_grid)
         self.latent_dim = latent_dim
@@ -213,7 +236,8 @@ class BEVEnhancement(nn.Module):
         if not 0 < config.bev_sigma_min < config.bev_sigma_max:
             raise ValueError('Invalid VIB scale limits')
         self.vib = VariationalInformationBottleneck(latent_dim, grid, config.pred_len,
-                   config.bev_sigma_min, config.bev_sigma_max) if config.bev_vib_enabled else None
+                   config.bev_sigma_min, config.bev_sigma_max, channels,
+                   getattr(config, 'bev_vib_spatial_grid', 4)) if config.bev_vib_enabled else None
         self.deterministic_encoder = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(),
                                                    nn.Linear(channels, latent_dim), nn.SiLU()) if self.vib is None else None
         self.time_dimension = width
@@ -274,6 +298,38 @@ class BEVEnhancement(nn.Module):
         alpha_bar = self.alpha_bars[timesteps].to(clean.dtype)[:, None, None, None]
         return alpha_bar.sqrt() * clean + (1.0 - alpha_bar).sqrt() * noise
 
+    def estimate_clean_features(self, observed, latent, past, layout, timesteps=None):
+        """One epsilon prediction, interpreted as an x0 estimate at an explicit t.
+
+        Treating the observed VIB map as x_t is an implementation assumption;
+        the method does not specify the input noise level or its timestep. Even
+        t=0 has alpha_bar=1-beta_start, not alpha_bar=1. No noise is added here.
+        """
+        if self.denoiser is None:
+            raise ValueError('Feature estimation requires a denoising network')
+        if self.alpha_bars.dtype not in (torch.float32, torch.float64):
+            raise ValueError('Single-step diffusion requires a float32 or float64 schedule; '
+                             'keep the module in float32 and use autocast for low-precision execution')
+        if timesteps is None:
+            timesteps = torch.full((observed.shape[0],), self.inference_t,
+                                   device=observed.device, dtype=torch.long)
+        if timesteps.shape != (observed.shape[0],) or timesteps.dtype != torch.long:
+            raise ValueError('timesteps must be a B-vector of integer schedule indices')
+        if bool(((timesteps < 0) | (timesteps >= self.diffusion_steps)).any()):
+            raise ValueError('timesteps must index the diffusion schedule')
+        alpha_bar = self.alpha_bars[timesteps].float()[:, None, None, None]
+        if not bool((torch.isfinite(alpha_bar) & (alpha_bar > 0) & (alpha_bar <= 1)).all()):
+            raise ValueError('Feature estimation requires finite alpha_bar in (0,1]')
+        frames = torch.cat((past, observed[:, None]), 1)
+        epsilon = self.denoiser(observed, self._condition(latent, timesteps), frames, layout)
+        if epsilon.shape != observed.shape:
+            raise ValueError('Denoiser epsilon prediction must match the spatial BEV shape')
+        estimate = (observed.float() - (1.0 - alpha_bar).sqrt() * epsilon.float()) / alpha_bar.sqrt()
+        estimate = estimate.to(observed.dtype)
+        if not bool(torch.isfinite(estimate).all()):
+            raise FloatingPointError('Single-step diffusion produced nonfinite enhanced features')
+        return estimate
+
     def _noise_loss(self, working, latent, past, layout, timesteps, noise):
         noisy = self.q_sample(working, timesteps, noise)
         frames = torch.cat((past, noisy[:, None]), 1)
@@ -286,8 +342,7 @@ class BEVEnhancement(nn.Module):
         if layout is None or layout.ndim != 3 or layout.shape[0] != bev.shape[0] or layout.shape[-1] != 7 or layout.shape[1] < 1:
             raise ValueError('Object layout must be padded B,M,7 detection labels')
         size = tuple(min(self.working_resolution, extent) for extent in bev.shape[-2:])
-        working = F.adaptive_avg_pool2d(bev, size)
-        past = working.new_empty((bev.shape[0], 0, self.channels, *size))
+        past = bev.new_empty((bev.shape[0], 0, self.channels, *size))
         if history is not None:
             if history.ndim != 5 or history.shape[0] != bev.shape[0] or history.shape[2:] != bev.shape[1:]:
                 raise ValueError('history must have shape B,T,C,H,W matching BEV')
@@ -295,19 +350,35 @@ class BEVEnhancement(nn.Module):
             past = F.adaptive_avg_pool2d(history.flatten(0, 1), size).reshape(
                 bev.shape[0], history.shape[1], self.channels, *size)
         compute_auxiliary = (self.training and self.stage in ('representation', 'joint')) or validate_diffusion
-        result = self.vib(bev, compute_auxiliary=compute_auxiliary) if self.vib is not None else {
-            'latent': self.deterministic_encoder(bev), 'loss_kl': bev.new_zeros(())}
+        if self.vib is not None:
+            result = self.vib(bev, compute_auxiliary=compute_auxiliary, spatial_size=size)
+        else:
+            latent = self.deterministic_encoder(bev)
+            result = {'semantic_latent': latent, 'latent': latent,
+                      'spatial_bev': F.adaptive_avg_pool2d(bev, size), 'loss_kl': bev.new_zeros(())}
+        working = result['spatial_bev']
         if self.layout_conditioning:
             tokens = self.layout_encoder(layout.detach())
         else:
             tokens = (self.layout_encoder.null_token.expand(bev.shape[0], -1, -1),
                       torch.zeros((bev.shape[0], 1), device=bev.device, dtype=torch.bool))
         clean_time = torch.zeros(bev.shape[0], device=bev.device, dtype=torch.long)
-        if self.clean_residual:
+        result['enhancement_mode'] = self.inference_mode
+        result['feature_source'] = 'single_step_epsilon_to_x0' if self.inference_mode == 'single_step' else 'legacy_clean_bypass'
+        result['spatial_source'] = 'vib_latent_decoder' if self.vib is not None else 'no_vib_ablation'
+        result['inference_t'] = self.inference_t if self.inference_mode == 'single_step' else None
+        result['inference_input_state'] = self.input_state if self.inference_mode == 'single_step' else None
+        if self.inference_mode == 'single_step':
+            enhanced = self.estimate_clean_features(working, result['semantic_latent'], past, tokens)
+            result['features'] = F.interpolate(enhanced, bev.shape[-2:], mode='bilinear', align_corners=False)
+            result['fused_delta'] = self.planning_projection(result['features'].mean(dim=(-1, -2)))
+        elif self.clean_residual:
+            # This is the explicit legacy compatibility/ablation branch only.
+            clean_working = F.adaptive_avg_pool2d(bev, size)
             condition = self._condition(result['latent'], clean_time)
-            fused = self.clean_projection(working) + condition[:, :, None, None]
+            fused = self.clean_projection(clean_working) + condition[:, :, None, None]
             if self.clean_modulation is not None:
-                fused = self.clean_modulation(fused, condition, torch.cat((past, working[:, None]), 1))
+                fused = self.clean_modulation(fused, condition, torch.cat((past, clean_working[:, None]), 1))
             residual = self.fusion_gain * self.clean_output(self.clean_alignment(fused, tokens))
             result['features'] = bev + F.interpolate(residual, bev.shape[-2:], mode='bilinear', align_corners=False)
             result['fused_delta'] = self.planning_projection(result['features'].mean(dim=(-1, -2)))
