@@ -103,6 +103,8 @@ class ORRPPlanner(nn.Module):
         self.dt = float(_parameter(config, "bev_waypoint_dt", 0.5))
         self.lidar_x = float(_parameter(config, "lidar_pos", [1.3, 0.0, 2.5])[0])
         self.cost_floor = float(_parameter(config, "bev_orrp_epsilon", 0.1))
+        self.grouping_policy = _parameter(config, "bev_orrp_grouping_policy", "legacy_nearest_four")
+        self._legacy_grouping_warned = False
         self.collision_radius = float(_parameter(config, "bev_orrp_collision_radius", 2.5))
         self.attention_grid = int(_parameter(config, "bev_orrp_attention_grid", 8))
         self.objective = _parameter(config, 'bev_score_objective', 'ratio')
@@ -125,6 +127,8 @@ class ORRPPlanner(nn.Module):
             raise ValueError("ORRP weights and safety margin must be finite and nonnegative")
         if self.objective not in ("ratio", "cost", "reward"):
             raise ValueError("bev_score_objective must be ratio, cost or reward")
+        if self.grouping_policy not in ("explicit", "legacy_nearest_four"):
+            raise ValueError("bev_orrp_grouping_policy must be explicit or legacy_nearest_four")
         if min(self.pred_len, self.num_candidates, self.hidden_size, self.attention_grid) < 1:
             raise ValueError("Trajectory and attention dimensions must be positive")
         if min(self.dt, self.cost_floor, self.collision_radius) <= 0:
@@ -198,17 +202,59 @@ class ORRPPlanner(nn.Module):
 
         if not all(torch.isfinite(value).all() for value in (cost, reward, penalty)):
             raise ValueError("ORRP cost, reward and penalty must be finite")
-        cost = cost.clamp_min(self.cost_floor)
         driving_reward = reward - penalty
         if self.objective == "cost":
             scores = -cost
         elif self.objective == "reward":
             scores = driving_reward
         else:
+            if (cost <= 0).any():
+                raise ValueError("Paper RR requires finite positive raw cost; zero cost is undefined. "
+                                 "Use reference details for the separate execution protection policy.")
             scores = 1.0 + driving_reward / cost
         if not torch.isfinite(scores).all():
             raise ValueError("ORRP reference scores overflowed")
         return scores
+
+    def _reference_score_state(self, raw_cost, reward, penalty):
+        finite_inputs = torch.isfinite(raw_cost) & torch.isfinite(reward) & torch.isfinite(penalty)
+        domain_valid = finite_inputs & (raw_cost > 0)
+        sanitized_reward = torch.where(finite_inputs, reward, torch.zeros_like(reward))
+        sanitized_penalty = torch.where(finite_inputs, penalty, torch.zeros_like(penalty))
+        numerator = sanitized_reward - sanitized_penalty
+        denominator = torch.where(domain_valid, raw_cost, torch.ones_like(raw_cost))
+        paper_scores = 1.0 + numerator / denominator
+        paper_valid = domain_valid & torch.isfinite(paper_scores)
+        paper_scores = torch.where(paper_valid, paper_scores, torch.zeros_like(paper_scores))
+        execution_input_valid = finite_inputs & (raw_cost >= 0)
+        execution_cost = torch.where(domain_valid, raw_cost, torch.full_like(raw_cost, self.cost_floor))
+        if self.objective == "cost":
+            reference = -raw_cost
+            reference_valid = finite_inputs & (raw_cost >= 0)
+            execution_scores = -execution_cost
+        elif self.objective == "reward":
+            reference = numerator
+            reference_valid = finite_inputs & torch.isfinite(reference)
+            execution_scores = numerator
+        else:
+            reference = paper_scores
+            reference_valid = paper_valid
+            execution_scores = 1.0 + numerator / execution_cost
+        execution_valid = execution_input_valid & torch.isfinite(execution_scores)
+        reference = torch.where(reference_valid, reference, torch.zeros_like(reference))
+        execution_scores = torch.where(execution_valid, execution_scores, torch.zeros_like(execution_scores))
+        return {"raw_cost": raw_cost, "reference_cost": raw_cost, "reference_scores": reference,
+                "reference_score_valid_mask": reference_valid, "paper_scores": paper_scores,
+                "paper_score_valid_mask": paper_valid, "paper_score_domain_mask": domain_valid,
+                "paper_score_placeholder": 0.0,
+                "score_invalid_mask": ~paper_valid,
+                "score_overflow_mask": domain_valid & ~paper_valid,
+                "execution_cost": execution_cost, "execution_scores": execution_scores,
+                "execution_score_valid_mask": execution_valid,
+                "cost_protection_mask": execution_input_valid & (raw_cost == 0),
+                "execution_cost_policy": "zero_cost_floor_fallback_only",
+                "configured_cost_floor": self.cost_floor,
+                "distance_reward": reward, "collision_penalty": penalty}
 
     def _predict_physics(self, interaction, candidates, ego_vel):
 
@@ -231,7 +277,8 @@ class ORRPPlanner(nn.Module):
                 "predicted_heading_changes": changes,
                 "predicted_acceleration_cost": acceleration_cost,
                 "predicted_heading_cost": heading_cost,
-                "predicted_cost": (acceleration_cost + heading_cost).clamp_min(self.cost_floor)}
+                "predicted_cost": acceleration_cost + heading_cost,
+                "predicted_raw_cost": acceleration_cost + heading_cost}
 
     def _semantic_similarity(self, trajectories, target_point, mask=None):
 
@@ -386,11 +433,69 @@ class ORRPPlanner(nn.Module):
                 neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws)
         return collisions, proximity
 
+    def _construct_interaction_pairs(self, candidates, neighbors, neighbor_current_mask):
+        batch = candidates.shape[0]
+        count = 0 if neighbors is None else neighbors.shape[1]
+        neighbor_indices = torch.arange(count, device=candidates.device)
+        pairs = torch.stack((torch.full_like(neighbor_indices, -1), neighbor_indices), -1)
+        pairs = pairs[None].expand(batch, -1, -1)
+        if count == 0:
+            active = torch.zeros((batch, 0), dtype=torch.bool, device=candidates.device)
+        else:
+            if neighbor_current_mask is None or neighbor_current_mask.shape != (batch, count):
+                raise ValueError("Interaction pairs require the current neighbor mask")
+            active = neighbor_current_mask.to(device=candidates.device, dtype=torch.bool)
+        return pairs, active
+
+    def _interaction_groups(self, proximity, pair_active, interaction_group_indices):
+        if interaction_group_indices is not None:
+            groups = torch.as_tensor(interaction_group_indices, device=pair_active.device)
+            if groups.shape == pair_active.shape[1:]:
+                groups = groups[None].expand_as(pair_active)
+            if groups.shape != pair_active.shape:
+                raise ValueError("interaction_group_indices must have shape (M,) or (B, M)")
+            if not ((groups == -1) | (groups == 1) | (groups == 2)).all():
+                raise ValueError("Interaction group indices must be 1 (rho1), 2 (rho2), or -1 (excluded)")
+            source = "explicit_indices"
+            groups = groups.to(torch.long)
+        elif pair_active.shape[1] == 0:
+            groups = torch.empty_like(pair_active, dtype=torch.long)
+            source = "no_interaction_pairs"
+        elif not pair_active.any():
+            groups = torch.full_like(pair_active, -1, dtype=torch.long)
+            source = "no_active_interaction_pairs"
+        elif self.grouping_policy == "explicit":
+            raise ValueError("Explicit ORRP grouping requires interaction_group_indices; "
+                             "the paper does not uniquely define the rho groups")
+        else:
+            if not self._legacy_grouping_warned:
+                warnings.warn("ORRP uses legacy_nearest_four grouping for ego-other pairs. "
+                              "This compatibility assumption is not a uniquely specified paper grouping "
+                              "and does not include neighbor-neighbor pairs; provide explicit group indices.",
+                              UserWarning, stacklevel=3)
+                self._legacy_grouping_warned = True
+            ranks = proximity.argsort(dim=-1).argsort(dim=-1)
+            groups = torch.where(ranks < 4, 1, 2)
+            source = "legacy_nearest_four"
+        return groups.masked_fill(~pair_active, -1), source
+
+    def _weighted_interaction_penalty(self, risk, semantic_weight, group_indices, pair_active):
+        if risk.shape != semantic_weight.shape or risk.shape[0:1] + risk.shape[2:] != group_indices.shape:
+            raise ValueError("Risk, semantic weights and interaction groups must align")
+        if not torch.isfinite(risk).all() or not torch.isfinite(semantic_weight).all():
+            raise ValueError("Interaction risk and semantic weights must be finite")
+        weights = self._weights()
+        rho = torch.where(group_indices == 1, weights["rho1"], weights["rho2"])
+        rho = torch.where(pair_active & (group_indices != -1), rho, torch.zeros_like(rho))
+        contributions = weights["mu2"] * risk * semantic_weight * rho[:, None]
+        return contributions.sum(-1), contributions
+
     @torch.no_grad()
     def compute_reference_scores(self, candidates, ego_vel, target_point=None,
                                  neighbors=None, neighbor_mask=None, neighbor_current=None,
                                  neighbor_current_mask=None, neighbor_radii=None,
-                                 neighbor_extents=None, neighbor_yaws=None, *, physical_quantities=None):
+                                 neighbor_extents=None, neighbor_yaws=None, *, physical_quantities=None,
+                                 interaction_group_indices=None, return_details=False):
 
         if physical_quantities is None:
             warnings.warn("No physical_quantities supplied: computing legacy geometric RR with fixed dt. "
@@ -399,11 +504,13 @@ class ORRPPlanner(nn.Module):
         with torch.autocast(device_type=candidates.device.type, enabled=False):
             return self._reference_impl(candidates, ego_vel, target_point, neighbors, neighbor_mask,
                 neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
-                physical_quantities=physical_quantities)
+                physical_quantities=physical_quantities, interaction_group_indices=interaction_group_indices,
+                return_details=return_details)
 
     def _reference_impl(self, candidates, ego_vel, target_point, neighbors, neighbor_mask,
                         neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
-                        geometry=None, return_components=False, physical_quantities=None):
+                        geometry=None, return_components=False, physical_quantities=None,
+                        interaction_group_indices=None, return_details=False):
         if candidates.ndim != 4 or candidates.shape[-2:] != (self.pred_len, 2):
             raise ValueError("candidates must have shape (B, N, pred_len, 2)")
         dtype = torch.float64 if candidates.dtype == torch.float64 else torch.float32
@@ -429,12 +536,17 @@ class ORRPPlanner(nn.Module):
                 quantities.append(value.to(candidates))
             interval, speeds, heading_changes = quantities
         acceleration_cost, heading_cost = self._control_cost(interval, speeds, heading_changes, ego_vel)
-        cost = (acceleration_cost + heading_cost).clamp_min(self.cost_floor)
+        cost = acceleration_cost + heading_cost
         reward = weights["mu1"] * distances.sum(-1)
         penalty = torch.zeros_like(reward)
         _, proximity, clearance = geometry if geometry is not None else self._collision_geometry(candidates, neighbors, neighbor_mask,
             neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws)
-        if self.objective != 'cost' and neighbors is not None and neighbors.shape[1] > 0:
+        pairs, pair_active = self._construct_interaction_pairs(candidates, neighbors, neighbor_current_mask)
+        groups, group_source = self._interaction_groups(proximity, pair_active, interaction_group_indices)
+        risk = torch.exp(-clearance.clamp_min(0) / self.risk_scale)
+        semantic_weight = torch.zeros_like(risk)
+        contributions = torch.zeros_like(risk)
+        if neighbors is not None and neighbors.shape[1] > 0:
             neighbors = neighbors.to(candidates)
             valid = torch.isfinite(neighbors).all(dim=-1)
             if neighbor_mask is not None:
@@ -450,12 +562,18 @@ class ORRPPlanner(nn.Module):
             theta_route = self._semantic_similarity(candidates, target)
             theta_neighbor = self._semantic_similarity(neighbors, target, valid)
             semantic_weight = (theta_route[:, :, None] + theta_neighbor[:, None, :]) / 2.0
-            ranks = proximity.argsort(dim=-1).argsort(dim=-1)
-            penalty_weights = torch.where(ranks < 4, weights["rho1"], weights["rho2"])
-
-
-            risk = torch.exp(-clearance.clamp_min(0) / self.risk_scale)
-            penalty = weights["mu2"] * (risk * (1.0 + semantic_weight) * penalty_weights[:, None]).sum(-1)
+            penalty, contributions = self._weighted_interaction_penalty(risk, semantic_weight, groups, pair_active)
+        if return_details:
+            return {**self._reference_score_state(cost, reward, penalty),
+                    "interaction_pairs": pairs, "interaction_pair_active_mask": pair_active,
+                    "interaction_pair_scope": "candidate_ego_to_neighbor_only",
+                    "interaction_ego_index": -1, "includes_neighbor_neighbor_pairs": False,
+                    "interaction_group_indices": groups, "interaction_group_source": group_source,
+                    "interaction_risk": risk, "interaction_semantic_weight": semantic_weight,
+                    "interaction_penalty_contributions": contributions,
+                    "interaction_risk_function": "exp(-max(swept_rectangle_clearance, 0) / risk_scale)",
+                    "reference_physics_source": ("supplied_physical_quantities" if physical_quantities is not None
+                                                  else "legacy_geometry_fixed_dt")}
         reference = self._objective_scores(cost, reward, penalty)
         if return_components:
             return reference, cost, reward, penalty
@@ -468,10 +586,64 @@ class ORRPPlanner(nn.Module):
         tail = self.score_bound - knee * knee / magnitude.clamp_min(knee)
         return torch.where(magnitude <= knee, raw, raw.sign() * tail)
 
+    def rank_paper_candidates(self, candidates, paper_scores, paper_score_valid_mask=None):
+        if paper_scores.shape != candidates.shape[:2]:
+            raise ValueError("Paper scores must match candidate batch and count")
+        finite = torch.isfinite(paper_scores)
+        if paper_score_valid_mask is None:
+            if not finite.all():
+                raise ValueError("Nonfinite paper scores require an explicit validity mask")
+            valid = finite
+        else:
+            if paper_score_valid_mask.shape != paper_scores.shape:
+                raise ValueError("Paper score validity mask must match scores")
+            valid = paper_score_valid_mask.to(device=paper_scores.device, dtype=torch.bool) & finite
+        valid = valid & torch.isfinite(candidates).all(dim=(-1, -2))
+        available = valid.any(-1)
+        best = paper_scores.masked_fill(~valid, -torch.inf).argmax(-1)
+        rows = torch.arange(candidates.shape[0], device=candidates.device)
+        waypoints = candidates[rows, best]
+        placeholder = candidates.new_tensor([-self.lidar_x, 0.0]).expand_as(waypoints)
+        waypoints = torch.where(available[:, None, None], waypoints, placeholder)
+        return {"paper_best_index": best.masked_fill(~available, -1),
+                "paper_waypoints": waypoints, "paper_selection_available": available,
+                "paper_waypoints_placeholder": "ego_origin_when_no_defined_rr",
+                "paper_selection_source": "raw_rr_argmax_without_execution_filters"}
+
+    def apply_execution_protection(self, candidates, selection_scores, feasible,
+                                   paper_selection, score_valid_mask=None, cost_protection_mask=None):
+        if selection_scores.shape != candidates.shape[:2] or feasible.shape != selection_scores.shape:
+            raise ValueError("Execution scores and feasibility must match candidates")
+        valid = torch.isfinite(selection_scores) & torch.isfinite(candidates).all(dim=(-1, -2))
+        if score_valid_mask is not None:
+            if score_valid_mask.shape != valid.shape:
+                raise ValueError("Execution score validity mask must match scores")
+            valid = valid & score_valid_mask
+        feasible = feasible.to(dtype=torch.bool) & valid
+        best = selection_scores.masked_fill(~feasible, -torch.inf).argmax(-1)
+        rows = torch.arange(candidates.shape[0], device=candidates.device)
+        waypoints = candidates[rows, best]
+        emergency_stop = ~feasible.any(-1)
+        stopped = candidates.new_tensor([-self.lidar_x, 0.0]).expand_as(waypoints)
+        waypoints = torch.where(emergency_stop[:, None, None], stopped, waypoints)
+        safe_best = best.masked_fill(emergency_stop, -1)
+        changed = emergency_stop | (safe_best != paper_selection["paper_best_index"])
+        numerical_protection = torch.zeros_like(emergency_stop)
+        if cost_protection_mask is not None:
+            if cost_protection_mask.shape != feasible.shape:
+                raise ValueError("Cost protection mask must match scores")
+            numerical_protection = cost_protection_mask.any(-1)
+        return {"safe_best_index": safe_best, "selected_indices": safe_best,
+                "waypoints": waypoints, "safe_waypoints": waypoints,
+                "emergency_stop": emergency_stop, "feasible": feasible,
+                "protection_changed_selection": changed,
+                "protection_triggered": changed | (~feasible).any(-1) | numerical_protection,
+                "execution_selection_source": "collision_reachability_and_numeric_protection"}
+
     def forward(self, bev, fused_features, target_point, ego_vel,
                 expert_waypoints=None, neighbors=None, neighbor_mask=None, neighbor_current=None,
                 neighbor_current_mask=None, neighbor_radii=None,
-                neighbor_extents=None, neighbor_yaws=None, diagnostics=None):
+                neighbor_extents=None, neighbor_yaws=None, diagnostics=None, interaction_group_indices=None):
         batch = bev.shape[0]
         speed = ego_vel.reshape(batch, -1)[:, :1].to(bev)
         target = lbc_target_to_ego(target_point.to(bev))
@@ -519,12 +691,15 @@ class ORRPPlanner(nn.Module):
                 neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
                 need_clearance=True)
         with torch.autocast(device_type=bev.device.type, enabled=False):
-            physics_scores, reference_cost, reward, penalty = self._reference_impl(candidates.detach(), speed, target_point, neighbors,
+            reference_details = self._reference_impl(candidates.detach(), speed, target_point, neighbors,
                 neighbor_mask, neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents,
-                neighbor_yaws, geometry=geometry, return_components=True, physical_quantities=physics)
+                neighbor_yaws, geometry=geometry, physical_quantities=physics,
+                interaction_group_indices=interaction_group_indices, return_details=True)
+        physics_scores = reference_details["reference_scores"]
         reference_scores = physics_scores.detach()
-        reference_cost = reference_cost.detach()
-        reward, penalty = reward.detach(), penalty.detach()
+        reference_details = {key: value.detach() if isinstance(value, torch.Tensor) else value
+                             for key, value in reference_details.items()}
+        reference_details["reference_physics_source"] = "attention_physical_heads"
         score_residual = scores - reference_scores
 
 
@@ -541,27 +716,31 @@ class ORRPPlanner(nn.Module):
                 raise ValueError("expert_waypoints must have shape (B, pred_len, 2)")
             errors = (candidates - expert_waypoints[:, None].to(candidates)).abs().mean(dim=(-1, -2))
             loss_wp = errors.min(dim=1).values.mean() + self.all_candidate_weight * errors.mean()
-        selection_scores = reference_scores if self.objective == "ratio" or self.selection == "analytic" else scores
-        feasible = feasible & torch.isfinite(selection_scores)
-        selection_scores = selection_scores.masked_fill(~feasible, -torch.inf)
-        best = selection_scores.argmax(dim=1)
-        waypoints = candidates[torch.arange(batch, device=bev.device), best]
-        emergency_stop = ~feasible.any(-1)
-        stopped = candidates.new_tensor([-self.lidar_x, 0.0]).expand_as(waypoints)
-        waypoints = torch.where(emergency_stop[:, None, None], stopped, waypoints)
-        valid_batch = (~emergency_stop).float()
+        paper_selection = self.rank_paper_candidates(candidates, reference_details["paper_scores"],
+                                                     reference_details["paper_score_valid_mask"])
+        analytic_selection = self.objective == "ratio" or self.selection == "analytic"
+        selection_scores = reference_details["execution_scores"] if analytic_selection else scores
+        execution = self.apply_execution_protection(candidates, selection_scores, feasible, paper_selection,
+                    score_valid_mask=reference_details["execution_score_valid_mask"],
+                    cost_protection_mask=reference_details["cost_protection_mask"])
+        execution["execution_score_source"] = ("reference_rr_with_explicit_zero_cost_fallback"
+                                               if self.objective == "ratio" else
+                                               "reference_objective" if analytic_selection else "learned_scores")
+        feasible, emergency_stop = execution["feasible"], execution["emergency_stop"]
+        diagnostic_feasible = feasible & reference_details["reference_score_valid_mask"]
+        diagnostic_available = diagnostic_feasible.any(-1)
+        valid_batch = diagnostic_available.float()
         agreement = regret = scores.new_zeros(())
         if diagnostics:
-            learned_best = scores.masked_fill(~feasible, -torch.inf).argmax(1)
-            analytic_best = reference_scores.masked_fill(~feasible, -torch.inf).argmax(1)
+            learned_best = scores.masked_fill(~diagnostic_feasible, -torch.inf).argmax(1)
+            analytic_best = reference_scores.masked_fill(~diagnostic_feasible, -torch.inf).argmax(1)
             agreement = ((learned_best == analytic_best).float() * valid_batch).sum() / valid_batch.sum().clamp_min(1)
             rows = torch.arange(batch, device=bev.device)
             regret = reference_scores[rows, analytic_best] - reference_scores[rows, learned_best]
-            regret = torch.where(emergency_stop, torch.zeros_like(regret), regret).sum() / valid_batch.sum().clamp_min(1)
-        selected_indices = best.masked_fill(emergency_stop, -1)
-        return {**physics, "physics_scores": physics_scores, "score_residual": score_residual,
-                "reference_cost": reference_cost, "distance_reward": reward, "collision_penalty": penalty,
-                "waypoints": waypoints, "selected_indices": selected_indices, "candidates": candidates, "scores": scores,
+            regret = torch.where(diagnostic_available, regret, torch.zeros_like(regret)).sum() / valid_batch.sum().clamp_min(1)
+        return {**physics, **reference_details, **paper_selection, **execution,
+                "physics_scores": physics_scores, "score_residual": score_residual,
+                "candidates": candidates, "scores": scores,
                 "reference_scores": reference_scores, "loss_wp": loss_wp, "loss_behavior": loss_behavior,
                 "emergency_stop": emergency_stop, "feasible": feasible, "kinematically_feasible": reachable,
                 "metric_rank_agreement": agreement, "metric_score_regret": regret,
