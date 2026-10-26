@@ -69,16 +69,13 @@ class GeometricFusionBackbone(nn.Module):
             self.change_channel_conv_image = nn.Sequential()
             self.change_channel_conv_lidar = nn.Sequential()
 
-        # FPN fusion
         channel = self.config.bev_features_chanels
         self.relu = nn.ReLU(inplace=True)
-        # top down
         self.upsample = nn.Upsample(scale_factor=self.config.bev_upsample_factor, mode='bilinear', align_corners=False)
         self.up_conv5 = nn.Conv2d(channel, channel, (1, 1))
         self.up_conv4 = nn.Conv2d(channel, channel, (1, 1))
         self.up_conv3 = nn.Conv2d(channel, channel, (1, 1))
         
-        # lateral
         self.c5_conv = nn.Conv2d(self.config.perception_output_features, channel, (1, 1))
         
     def top_down(self, x):
@@ -91,15 +88,6 @@ class GeometricFusionBackbone(nn.Module):
         return p2, p3, p4, p5
 
     def forward(self, image, lidar, velocity, bev_points, img_points):
-        '''
-        Image + LiDAR feature fusion using transformers
-        Args:
-            image_list (list): list of input images
-            lidar_list (list): list of input LiDAR BEV
-            velocity (tensor): input velocity from speedometer
-            bev_points (tensor): projected image pixels onto the BEV grid
-            cam_points (tensor): projected LiDAR point cloud onto the image space
-        '''
 
         if self.image_encoder.normalize:
             image_tensor = normalize_imagenet(image)
@@ -130,7 +118,6 @@ class GeometricFusionBackbone(nn.Module):
             curr_h_image, curr_w_image = image_embd_layer1.shape[-2:]
             curr_h_lidar, curr_w_lidar = lidar_embd_layer1.shape[-2:]
 
-            # project image features to bev
             bev_points_layer1 = bev_points.view(bz*curr_h_lidar*curr_w_lidar*5, 2)
             bev_encoding_layer1 = image_embd_layer1.permute(0,2,3,1).contiguous()[:,bev_points_layer1[:,1],bev_points_layer1[:,0]].view(bz, bz, curr_h_lidar, curr_w_lidar, 5, -1)
             bev_encoding_layer1 = torch.diagonal(bev_encoding_layer1, 0).permute(4,3,0,1,2).contiguous()
@@ -143,7 +130,6 @@ class GeometricFusionBackbone(nn.Module):
                 vel_embedding1 = self.vel_emb1(velocity).unsqueeze(-1).unsqueeze(-1)
                 lidar_features = lidar_features + vel_embedding1
 
-            # project bev features to image
             img_points_layer1 = img_points.view(bz*curr_h_image*curr_w_image*5, 2)
             img_encoding_layer1 = lidar_embd_layer1.permute(0,2,3,1).contiguous()[:,img_points_layer1[:,1],img_points_layer1[:,0]].view(bz, bz, curr_h_image, curr_w_image, 5, -1)
             img_encoding_layer1 = torch.diagonal(img_encoding_layer1, 0).permute(4,3,0,1,2).contiguous()
@@ -159,7 +145,6 @@ class GeometricFusionBackbone(nn.Module):
         image_features = self.image_encoder.features.layer2(image_features)
         lidar_features = self.lidar_encoder._model.layer2(lidar_features)
         if self.config.n_scale >= 3:
-            # fusion at (B, 128, 32, 32)
             image_embd_layer2 = self.image_conv2(image_features)
             image_embd_layer2 = self.avgpool_img(image_embd_layer2)
             lidar_embd_layer2 = self.lidar_conv2(lidar_features)
@@ -168,7 +153,6 @@ class GeometricFusionBackbone(nn.Module):
             curr_h_image, curr_w_image = image_embd_layer2.shape[-2:]
             curr_h_lidar, curr_w_lidar = lidar_embd_layer2.shape[-2:]
             
-            # project image features to bev
             bev_points_layer2 = bev_points.view(bz*curr_h_lidar*curr_w_lidar*5, 2)
             bev_encoding_layer2 = image_embd_layer2.permute(0,2,3,1).contiguous()[:,bev_points_layer2[:,1],bev_points_layer2[:,0]].view(bz, bz, curr_h_lidar, curr_w_lidar, 5, -1)
             bev_encoding_layer2 = torch.diagonal(bev_encoding_layer2, 0).permute(4,3,0,1,2).contiguous()
@@ -182,7 +166,6 @@ class GeometricFusionBackbone(nn.Module):
                 vel_embedding2 = self.vel_emb2(velocity).unsqueeze(-1).unsqueeze(-1)
                 lidar_features = lidar_features + vel_embedding2
 
-            # project bev features to image
             img_points_layer2 = img_points.view(bz*curr_h_image*curr_w_image*5, 2)
             img_encoding_layer2 = lidar_embd_layer2.permute(0,2,3,1).contiguous()[:,img_points_layer2[:,1],img_points_layer2[:,0]].view(bz, bz, curr_h_image, curr_w_image, 5, -1)
             img_encoding_layer2 = torch.diagonal(img_encoding_layer2, 0).permute(4,3,0,1,2).contiguous()
@@ -198,7 +181,6 @@ class GeometricFusionBackbone(nn.Module):
         image_features = self.image_encoder.features.layer3(image_features)
         lidar_features = self.lidar_encoder._model.layer3(lidar_features)
         if self.config.n_scale >= 2:
-            # fusion at (B, 256, 16, 16)
             image_embd_layer3 = self.image_conv3(image_features)
             image_embd_layer3 = self.avgpool_img(image_embd_layer3)
             lidar_embd_layer3 = self.lidar_conv3(lidar_features)
@@ -207,7 +189,6 @@ class GeometricFusionBackbone(nn.Module):
             curr_h_image, curr_w_image = image_embd_layer3.shape[-2:]
             curr_h_lidar, curr_w_lidar = lidar_embd_layer3.shape[-2:]
             
-            # project image features to bev
             bev_points_layer3 = bev_points.view(bz*curr_h_lidar*curr_w_lidar*5, 2)
             bev_encoding_layer3 = image_embd_layer3.permute(0,2,3,1).contiguous()[:,bev_points_layer3[:,1],bev_points_layer3[:,0]].view(bz, bz, curr_h_lidar, curr_w_lidar, 5, -1)
             bev_encoding_layer3 = torch.diagonal(bev_encoding_layer3, 0).permute(4,3,0,1,2).contiguous()
@@ -221,7 +202,6 @@ class GeometricFusionBackbone(nn.Module):
                 vel_embedding3 = self.vel_emb3(velocity).unsqueeze(-1).unsqueeze(-1)
                 lidar_features = lidar_features + vel_embedding3
 
-            # project bev features to image
             img_points_layer3 = img_points.view(bz*curr_h_image*curr_w_image*5, 2)
             img_encoding_layer3 = lidar_embd_layer3.permute(0,2,3,1).contiguous()[:,img_points_layer3[:,1],img_points_layer3[:,0]].view(bz, bz, curr_h_image, curr_w_image, 5, -1)
             img_encoding_layer3 = torch.diagonal(img_encoding_layer3, 0).permute(4,3,0,1,2).contiguous()
@@ -235,9 +215,7 @@ class GeometricFusionBackbone(nn.Module):
 
         image_features = self.image_encoder.features.layer4(image_features)
         lidar_features = self.lidar_encoder._model.layer4(lidar_features)
-        # fusion at (B, 512, 8, 8)
         if self.config.n_scale >= 1:
-            # fusion at (B, 512, 8, 8)
             image_embd_layer4 = self.image_conv4(image_features)
             image_embd_layer4 = self.avgpool_img(image_embd_layer4)
             lidar_embd_layer4 = self.lidar_conv4(lidar_features)
@@ -246,7 +224,6 @@ class GeometricFusionBackbone(nn.Module):
             curr_h_image, curr_w_image = image_embd_layer4.shape[-2:]
             curr_h_lidar, curr_w_lidar = lidar_embd_layer4.shape[-2:]
             
-            # project image features to bev
             bev_points_layer4 = bev_points.view(bz*curr_h_lidar*curr_w_lidar*5, 2)
             bev_encoding_layer4 = image_embd_layer4.permute(0,2,3,1).contiguous()[:,bev_points_layer4[:,1],bev_points_layer4[:,0]].view(bz, bz, curr_h_lidar, curr_w_lidar, 5, -1)
             bev_encoding_layer4 = torch.diagonal(bev_encoding_layer4, 0).permute(4,3,0,1,2).contiguous()
@@ -259,7 +236,6 @@ class GeometricFusionBackbone(nn.Module):
                 vel_embedding4 = self.vel_emb4(velocity).unsqueeze(-1).unsqueeze(-1)
                 lidar_features = lidar_features + vel_embedding4
 
-            # project bev features to image
             img_points_layer4 = img_points.view(bz*curr_h_image*curr_w_image*5, 2)
             img_encoding_layer4 = lidar_embd_layer3.permute(0,2,3,1).contiguous()[:,img_points_layer4[:,1],img_points_layer4[:,0]].view(bz, bz, curr_h_image, curr_w_image, 5, -1)
             img_encoding_layer4 = torch.diagonal(img_encoding_layer4, 0).permute(4,3,0,1,2).contiguous()
@@ -269,8 +245,6 @@ class GeometricFusionBackbone(nn.Module):
             image_features = image_features + image_features_layer4
             if self.use_velocity:
                 image_features = image_features + vel_embedding4
-
-        # Downsamples channels to 512
         image_features = self.change_channel_conv_image(image_features)
         lidar_features = self.change_channel_conv_lidar(lidar_features)
 
@@ -289,20 +263,12 @@ class GeometricFusionBackbone(nn.Module):
 
         
 class ImageCNN(nn.Module):
-    """ 
-    Encoder network for image input list.
-    Args:
-        architecture (string): Vision architecture to be used from the TIMM model library.
-        c_dim (int): output dimension of the latent embedding
-        normalize (bool): whether the input images should be normalized
-    """
 
     def __init__(self, architecture, normalize=True):
         super().__init__()
         self.normalize = normalize
         self.features = timm.create_model(architecture, pretrained=True)
         self.features.fc = None
-        # Delete parts of the networks we don't want
         if (architecture.startswith('regnet')): # Rename modules so we can use the same code
             self.features.conv1 = self.features.stem.conv
             self.features.bn1  = self.features.stem.bn
@@ -340,10 +306,7 @@ class ImageCNN(nn.Module):
 
 
 def normalize_imagenet(x):
-    """ Normalize input images according to ImageNet standards.
-    Args:
-        x (tensor): input images
-    """
+    
     x = x.clone()
     x[:, 0] = ((x[:, 0] / 255.0) - 0.485) / 0.229
     x[:, 1] = ((x[:, 1] / 255.0) - 0.456) / 0.224
@@ -352,13 +315,7 @@ def normalize_imagenet(x):
 
 
 class LidarEncoder(nn.Module):
-    """
-    Encoder network for LiDAR input list
-    Args:
-        architecture (string): Vision architecture to be used from the TIMM model library.
-        num_classes: output feature dimension
-        in_channels: input channels
-    """
+    
 
     def __init__(self, architecture, in_channels=2):
         super().__init__()
@@ -399,7 +356,6 @@ class LidarEncoder(nn.Module):
         use_bias = (_tmp.bias != None)
         self._model.conv1 = nn.Conv2d(in_channels, out_channels=_tmp.out_channels, 
             kernel_size=_tmp.kernel_size, stride=_tmp.stride, padding=_tmp.padding, bias=use_bias)
-        # Need to delete the old conv_layer to avoid unused parameters
         del _tmp
         del self._model.stem
         torch.cuda.empty_cache()
