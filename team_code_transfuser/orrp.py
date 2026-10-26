@@ -1,11 +1,5 @@
-"""Candidate ranking and conservative swept-box collision checks.
-
-Coordinates are virtual LiDAR x-forward/y-right with ego at (-lidar_x, 0).
-Rotation intervals use midpoint rectangles inflated by a corner-displacement
-bound. Neighbor motion uses constant velocity and fixed yaw.
-"""
-
 import math
+import warnings
 
 try:
     from .vehicle_control import forward_reachable
@@ -86,8 +80,8 @@ def detection_neighbors(labels, config, pred_len=None, return_context=False, ret
     mask = valid[..., None].expand(-1, -1, pred_len)
     trajectories = torch.where(mask[..., None], trajectories, torch.zeros_like(trajectories))
     if return_context or return_geometry:
-        # Raster width is lateral, raster height is longitudinal. Do not swap
-        # physical half-length and half-width when converting detector boxes.
+
+
         extents = boxes[..., [3, 2]] / (2.0 * ppm)
         radii = torch.linalg.vector_norm(extents, dim=-1)
         context = (trajectories, mask, centres, valid, radii)
@@ -111,8 +105,9 @@ class ORRPPlanner(nn.Module):
         self.cost_floor = float(_parameter(config, "bev_orrp_epsilon", 0.1))
         self.collision_radius = float(_parameter(config, "bev_orrp_collision_radius", 2.5))
         self.attention_grid = int(_parameter(config, "bev_orrp_attention_grid", 8))
-        self.selection = _parameter(config, "bev_score_selection", "learned")
         self.objective = _parameter(config, 'bev_score_objective', 'ratio')
+        self.selection = _parameter(config, "bev_score_selection",
+                                    "analytic" if self.objective == "ratio" else "learned")
         self.all_candidate_weight = float(_parameter(config, "bev_all_candidate_weight", 0.05))
         self.ego_extent = (float(_parameter(config, "ego_extent_x", 2.4508416652679443)),
                            float(_parameter(config, "ego_extent_y", 1.0641621351242065)))
@@ -136,6 +131,11 @@ class ORRPPlanner(nn.Module):
             raise ValueError("Waypoint dt, control cost floor and collision radius must be positive")
         if self.selection not in ("learned", "analytic"):
             raise ValueError("bev_score_selection must be 'learned' or 'analytic'")
+        if self.objective == "ratio" and self.selection == "learned":
+            warnings.warn("bev_score_selection='learned' is a compatibility alias for 'analytic' "
+                          "in ratio mode: final selection uses raw RR; learned scores remain "
+                          "available for behavior MSE and diagnostics.", UserWarning, stacklevel=2)
+            self.selection = "analytic"
         hidden = self.hidden_size
         self.context = nn.Sequential(nn.Linear(fused_dim + channels + 3, hidden), nn.SiLU(),
                                      nn.Linear(hidden, hidden))
@@ -148,11 +148,90 @@ class ORRPPlanner(nn.Module):
         heads = next(heads for heads in (4, 2, 1) if hidden % heads == 0)
         self.cross_attention = nn.MultiheadAttention(hidden, heads, dropout=0.0, batch_first=True)
         self.attention_norm = nn.LayerNorm(hidden)
-        self.score_head = nn.Sequential(nn.Linear(3 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        self.score_head = nn.Sequential(nn.Linear(3 * hidden + 1 + 2 * self.pred_len, hidden),
+                                        nn.SiLU(), nn.Linear(hidden, 1))
+
+
+        self.interval_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        self.speed_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        self.heading_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 1))
+        for head in (self.interval_head, self.speed_head, self.heading_head):
+            nn.init.normal_(head[-1].weight, std=0.01)
+            nn.init.zeros_(head[-1].bias)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        physical_keys = [prefix + name for name in self.state_dict()
+                         if name.startswith(("interval_head.", "speed_head.", "heading_head."))]
+        if any(key not in state_dict for key in physical_keys):
+            warnings.warn("ORRP checkpoint is missing physical-head parameters. Strict loading "
+                          "will reject it; non-strict loading leaves newly initialized parameters. "
+                          "Old scores are not equivalent to the physical-head RR model.",
+                          UserWarning, stacklevel=2)
+        score_weight = state_dict.get(prefix + "score_head.0.weight")
+        if score_weight is not None and score_weight.shape != self.score_head[0].weight.shape:
+            warnings.warn("ORRP score_head now consumes time, speed and heading predictions; "
+                          "this checkpoint has an incompatible input shape.", UserWarning, stacklevel=2)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
     def _weights(self):
         return {name: float(_parameter(self.config, "bev_orrp_" + name, 1.0))
                 for name in ("eta1", "eta2", "mu1", "mu2", "rho1", "rho2")}
+
+    def _control_cost(self, interval, speeds, heading_changes, ego_vel):
+
+        if (not torch.isfinite(interval).all() or (interval <= 0).any()
+                or not torch.isfinite(speeds).all() or (speeds < 0).any()
+                or not torch.isfinite(heading_changes).all()
+                or not torch.isfinite(ego_vel).all()):
+            raise ValueError("ORRP physical quantities must be finite with positive intervals and nonnegative speeds")
+        initial = ego_vel.reshape(speeds.shape[0], -1)[:, :1].to(speeds)
+        initial = initial[:, None].expand(-1, speeds.shape[1], -1)
+        accelerations = torch.diff(torch.cat((initial, speeds), -1), dim=-1) / interval
+        weights = self._weights()
+        acceleration_cost = weights["eta1"] * accelerations.abs().sum(-1)
+        heading_cost = weights["eta2"] * (heading_changes / interval).abs().sum(-1)
+        return acceleration_cost, heading_cost
+
+    def _objective_scores(self, cost, reward, penalty):
+
+        if not all(torch.isfinite(value).all() for value in (cost, reward, penalty)):
+            raise ValueError("ORRP cost, reward and penalty must be finite")
+        cost = cost.clamp_min(self.cost_floor)
+        driving_reward = reward - penalty
+        if self.objective == "cost":
+            scores = -cost
+        elif self.objective == "reward":
+            scores = driving_reward
+        else:
+            scores = 1.0 + driving_reward / cost
+        if not torch.isfinite(scores).all():
+            raise ValueError("ORRP reference scores overflowed")
+        return scores
+
+    def _predict_physics(self, interaction, candidates, ego_vel):
+
+
+        time_logits = self.interval_head(interaction.mean(2)).float()
+        speed_logits = self.speed_head(interaction).squeeze(-1).float()
+        heading_logits = self.heading_head(interaction).squeeze(-1).float()
+
+
+        with torch.no_grad(), torch.autocast(device_type=candidates.device.type, enabled=False):
+            distances, _, rates, _ = trajectory_kinematics(
+                candidates.detach().float(), ego_vel.detach().float(), self.dt, self.lidar_x)
+            heading_changes = rates * self.dt
+        interval = self.dt * (1.0 + 0.5 * time_logits.tanh())
+        speeds = distances / interval * torch.exp(0.5 * speed_logits.tanh())
+        changes = wrap_angle(heading_changes + (math.pi / 4) * heading_logits.tanh())
+        changes = torch.where(distances > 1e-6, changes, torch.zeros_like(changes))
+        acceleration_cost, heading_cost = self._control_cost(interval, speeds, changes, ego_vel)
+        return {"predicted_interval": interval, "predicted_speeds": speeds,
+                "predicted_heading_changes": changes,
+                "predicted_acceleration_cost": acceleration_cost,
+                "predicted_heading_cost": heading_cost,
+                "predicted_cost": (acceleration_cost + heading_cost).clamp_min(self.cost_floor)}
 
     def _semantic_similarity(self, trajectories, target_point, mask=None):
 
@@ -172,7 +251,7 @@ class ORRPPlanner(nn.Module):
 
     @staticmethod
     def _sat_collision(offset, motion, radii):
-        """Exact overlap interval for translating fixed-yaw rectangles."""
+
         moving = motion.abs() > torch.finfo(motion.dtype).eps
         denominator = torch.where(moving, motion, torch.ones_like(motion))
         first, second = (-radii - offset) / denominator, (radii - offset) / denominator
@@ -183,11 +262,8 @@ class ORRPPlanner(nn.Module):
 
     @staticmethod
     def _minimum_clearance(offset, motion, radii):
-        """Minimum SAT separation over [0,1], a lower bound on Euclidean clearance.
 
-        The maximum of eight affine functions is minimized at an endpoint or
-        line intersection. Looping 28 pairs avoids a large pairwise tensor.
-        """
+
         intercept = torch.cat((offset - radii, -offset - radii), -1)
         slope = torch.cat((motion, -motion), -1)
         best = torch.minimum(intercept.amax(-1), (intercept + slope).amax(-1))
@@ -204,7 +280,7 @@ class ORRPPlanner(nn.Module):
         return best
 
     def _project_geometry(self, relative, motion, ego_yaw, extents, other_yaw):
-        # Leading dimensions are B, candidate, neighbor, time.
+
         ego_u = torch.stack((ego_yaw.cos(), ego_yaw.sin()), -1)[:, :, None]
         ego_v = torch.stack((-ego_yaw.sin(), ego_yaw.cos()), -1)[:, :, None]
         other_u = torch.stack((other_yaw.cos(), other_yaw.sin()), -1)[:, None, :, None]
@@ -243,8 +319,8 @@ class ORRPPlanner(nn.Module):
         if (neighbor_extents is None) != (neighbor_yaws is None):
             raise ValueError('Neighbor extents and yaws must be supplied together')
         if neighbor_extents is None:
-            # Compatibility for old five-item contexts only. A radius cannot
-            # recover an oriented rectangle: use its conservative square.
+
+
             if neighbor_radii is None or neighbor_radii.shape != neighbors.shape[:2]:
                 raise ValueError('Continuous checking requires rectangular geometry or legacy radii')
             neighbor_extents = neighbor_radii[..., None].expand(-1, -1, 2)
@@ -290,7 +366,7 @@ class ORRPPlanner(nn.Module):
         motion = (relative[..., 1:, :] - relative[..., :-1, :]).flatten(-3, -2)
         midpoint_yaws = (starts[..., None] + turns[..., None] * ((u[:-1] + u[1:]) / 2)).flatten(-2)
         offset, projected_motion, radii = self._project_geometry(begin, motion, midpoint_yaws, extents, yaws)
-        # Every corner stays within 2*r*sin(delta_yaw/4) of the midpoint box.
+
         rotational_error = 2 * math.hypot(*self.ego_extent) * torch.sin(turns.abs() / (4 * pieces))
         rotational_error = rotational_error[..., None].expand(-1, -1, -1, pieces).flatten(-2)
         radii = radii + rotational_error[:, :, None, :, None]
@@ -314,13 +390,20 @@ class ORRPPlanner(nn.Module):
     def compute_reference_scores(self, candidates, ego_vel, target_point=None,
                                  neighbors=None, neighbor_mask=None, neighbor_current=None,
                                  neighbor_current_mask=None, neighbor_radii=None,
-                                 neighbor_extents=None, neighbor_yaws=None):
+                                 neighbor_extents=None, neighbor_yaws=None, *, physical_quantities=None):
+
+        if physical_quantities is None:
+            warnings.warn("No physical_quantities supplied: computing legacy geometric RR with fixed dt. "
+                          "Pass physical_quantities=plan to reproduce the attention-based reference scores.",
+                          UserWarning, stacklevel=2)
         with torch.autocast(device_type=candidates.device.type, enabled=False):
             return self._reference_impl(candidates, ego_vel, target_point, neighbors, neighbor_mask,
-                neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws)
+                neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
+                physical_quantities=physical_quantities)
 
     def _reference_impl(self, candidates, ego_vel, target_point, neighbors, neighbor_mask,
-                        neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws, geometry=None):
+                        neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
+                        geometry=None, return_components=False, physical_quantities=None):
         if candidates.ndim != 4 or candidates.shape[-2:] != (self.pred_len, 2):
             raise ValueError("candidates must have shape (B, N, pred_len, 2)")
         dtype = torch.float64 if candidates.dtype == torch.float64 else torch.float32
@@ -329,13 +412,27 @@ class ORRPPlanner(nn.Module):
             raise ValueError('Candidate trajectories and ego velocity must be finite')
         ego_vel = ego_vel.to(candidates)
         weights = self._weights()
-        distances, accelerations, heading_rates, _ = trajectory_kinematics(
+        distances, _, heading_rates, _ = trajectory_kinematics(
             candidates, ego_vel, self.dt, self.lidar_x)
-        cost = (weights["eta1"] * accelerations.abs().sum(-1)
-                + weights["eta2"] * heading_rates.abs().sum(-1)).clamp_min(self.cost_floor)
+        if physical_quantities is None:
+            interval = candidates.new_tensor(self.dt)
+            speeds = distances / self.dt
+            heading_changes = heading_rates * self.dt
+        else:
+            quantities = []
+            for name, shape in (("predicted_interval", candidates.shape[:2] + (1,)),
+                                ("predicted_speeds", candidates.shape[:-1]),
+                                ("predicted_heading_changes", candidates.shape[:-1])):
+                value = physical_quantities.get(name)
+                if not isinstance(value, torch.Tensor) or value.shape != shape:
+                    raise ValueError("Invalid physical quantity shape: " + name)
+                quantities.append(value.to(candidates))
+            interval, speeds, heading_changes = quantities
+        acceleration_cost, heading_cost = self._control_cost(interval, speeds, heading_changes, ego_vel)
+        cost = (acceleration_cost + heading_cost).clamp_min(self.cost_floor)
         reward = weights["mu1"] * distances.sum(-1)
-        reference = -cost if self.objective == 'cost' else reward if self.objective == 'reward' else 1.0 + reward / cost
-        collisions, proximity, clearance = geometry if geometry is not None else self._collision_geometry(candidates, neighbors, neighbor_mask,
+        penalty = torch.zeros_like(reward)
+        _, proximity, clearance = geometry if geometry is not None else self._collision_geometry(candidates, neighbors, neighbor_mask,
             neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws)
         if self.objective != 'cost' and neighbors is not None and neighbors.shape[1] > 0:
             neighbors = neighbors.to(candidates)
@@ -355,20 +452,17 @@ class ORRPPlanner(nn.Module):
             semantic_weight = (theta_route[:, :, None] + theta_neighbor[:, None, :]) / 2.0
             ranks = proximity.argsort(dim=-1).argsort(dim=-1)
             penalty_weights = torch.where(ranks < 4, weights["rho1"], weights["rho2"])
-            # Clearance remains nonconstant outside the collision set, so mu2,
-            # rho and semantic alignment affect feasible-candidate supervision.
+
+
             risk = torch.exp(-clearance.clamp_min(0) / self.risk_scale)
-            penalty = (risk * (1.0 + semantic_weight) * penalty_weights[:, None]).sum(-1)
-            reference = reference - weights["mu2"] * penalty
-        unsafe = collisions.any(-1)
-        if self.objective == 'ratio':
-            reference = torch.where(unsafe, reference.clamp_max(0) - self.unsafe_penalty, reference)
-        if not torch.isfinite(reference).all():
-            raise ValueError('ORRP reference scores overflowed')
-        return self.transform_scores(reference)
+            penalty = weights["mu2"] * (risk * (1.0 + semantic_weight) * penalty_weights[:, None]).sum(-1)
+        reference = self._objective_scores(cost, reward, penalty)
+        if return_components:
+            return reference, cost, reward, penalty
+        return reference
 
     def transform_scores(self, raw):
-        """Preserve the central scale and compress tails monotonically toward +/-B."""
+
         knee = self.score_bound / 2.0
         magnitude = raw.abs()
         tail = self.score_bound - knee * knee / magnitude.clamp_min(knee)
@@ -409,24 +503,36 @@ class ORRPPlanner(nn.Module):
         position = torch.stack((rows, columns), dim=-1).reshape(grid * grid, 2)
         bev_tokens = bev_tokens + self.bev_position(position)[None]
         attended, _ = self.cross_attention(queries, bev_tokens, bev_tokens, need_weights=False)
-        interaction = self.attention_norm(queries + attended).reshape(batch, self.num_candidates, self.pred_len, -1).mean(2)
-        score_features = torch.cat((interaction, hidden.reshape(batch, self.num_candidates, -1),
-                                    context[:, None].expand(-1, self.num_candidates, -1)), dim=-1)
-        scores = self.score_head(score_features).squeeze(-1)
+        interaction = self.attention_norm(queries + attended).reshape(batch, self.num_candidates, self.pred_len, -1)
+        physics = self._predict_physics(interaction, candidates, speed)
+        physical_features = torch.cat((physics["predicted_interval"] / self.dt,
+                                       physics["predicted_speeds"] / 32.0,
+                                       physics["predicted_heading_changes"] / math.pi), dim=-1).to(interaction)
+        score_features = torch.cat((interaction.mean(2), hidden.reshape(batch, self.num_candidates, -1),
+                                    context[:, None].expand(-1, self.num_candidates, -1), physical_features), dim=-1)
+        scores = self.score_head(score_features).squeeze(-1).float()
         diagnostics = (self.training or expert_waypoints is not None) if diagnostics is None else diagnostics
-        need_reference = diagnostics or self.selection == 'analytic'
+
+
         with torch.no_grad(), torch.autocast(device_type=bev.device.type, enabled=False):
             geometry = self._collision_geometry(candidates.detach(), neighbors, neighbor_mask,
                 neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents, neighbor_yaws,
-                need_clearance=need_reference)
-            reference_scores = (self._reference_impl(candidates, speed, target_point, neighbors,
+                need_clearance=True)
+        with torch.autocast(device_type=bev.device.type, enabled=False):
+            physics_scores, reference_cost, reward, penalty = self._reference_impl(candidates.detach(), speed, target_point, neighbors,
                 neighbor_mask, neighbor_current, neighbor_current_mask, neighbor_radii, neighbor_extents,
-                neighbor_yaws, geometry=geometry) if need_reference else None)
+                neighbor_yaws, geometry=geometry, return_components=True, physical_quantities=physics)
+        reference_scores = physics_scores.detach()
+        reference_cost = reference_cost.detach()
+        reward, penalty = reward.detach(), penalty.detach()
+        score_residual = scores - reference_scores
+
+
         reachable = forward_reachable(candidates.detach().float(), speed.float(), self.config)
         feasible = ~geometry[0].any(-1) & reachable
         if not torch.isfinite(scores).all():
             raise ValueError('Learned ORRP scores must be finite')
-        loss_behavior = (F.smooth_l1_loss(scores.float(), reference_scores.float())
+        loss_behavior = (F.mse_loss(scores.float(), reference_scores.float(), reduction="mean")
                          if diagnostics else scores.new_zeros(()))
         if expert_waypoints is None:
             loss_wp = candidates.sum() * 0.0
@@ -435,7 +541,7 @@ class ORRPPlanner(nn.Module):
                 raise ValueError("expert_waypoints must have shape (B, pred_len, 2)")
             errors = (candidates - expert_waypoints[:, None].to(candidates)).abs().mean(dim=(-1, -2))
             loss_wp = errors.min(dim=1).values.mean() + self.all_candidate_weight * errors.mean()
-        selection_scores = reference_scores if self.selection == "analytic" else scores
+        selection_scores = reference_scores if self.objective == "ratio" or self.selection == "analytic" else scores
         feasible = feasible & torch.isfinite(selection_scores)
         selection_scores = selection_scores.masked_fill(~feasible, -torch.inf)
         best = selection_scores.argmax(dim=1)
@@ -453,10 +559,14 @@ class ORRPPlanner(nn.Module):
             regret = reference_scores[rows, analytic_best] - reference_scores[rows, learned_best]
             regret = torch.where(emergency_stop, torch.zeros_like(regret), regret).sum() / valid_batch.sum().clamp_min(1)
         selected_indices = best.masked_fill(emergency_stop, -1)
-        return {"waypoints": waypoints, "selected_indices": selected_indices, "candidates": candidates, "scores": scores,
+        return {**physics, "physics_scores": physics_scores, "score_residual": score_residual,
+                "reference_cost": reference_cost, "distance_reward": reward, "collision_penalty": penalty,
+                "waypoints": waypoints, "selected_indices": selected_indices, "candidates": candidates, "scores": scores,
                 "reference_scores": reference_scores, "loss_wp": loss_wp, "loss_behavior": loss_behavior,
                 "emergency_stop": emergency_stop, "feasible": feasible, "kinematically_feasible": reachable,
                 "metric_rank_agreement": agreement, "metric_score_regret": regret,
                 "metric_rank_valid_fraction": valid_batch.mean(),
+
+
                 "metric_score_saturation": ((reference_scores.abs() >= .99 * self.score_bound).float().mean()
                     if diagnostics else scores.new_zeros(()))}
